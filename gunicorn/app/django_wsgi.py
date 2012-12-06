@@ -33,7 +33,7 @@ from gunicorn import util
 def make_wsgi_application():
     # validate models
     s = StringIO()
-    if get_validation_errors(s):
+    if not getattr(settings, "DISABLE_GUNICORN_VALIDATION", False) and get_validation_errors(s):
         s.seek(0)
         error = s.read()
         sys.stderr.write("One or more models did not validate:\n%s" % error)
