@@ -274,8 +274,14 @@ else:
     def u(s):
         return unicode(s, "unicode_escape")
     int2byte = chr
-    import StringIO
-    StringIO = BytesIO = StringIO.StringIO
+    import cStringIO
+    def StringIO(buf=''):
+        sio = cStringIO.StringIO()
+        if buf:
+            sio.write(buf)
+            sio.seek(0)
+        return sio
+    BytesIO = StringIO
 _add_doc(b, """Byte literal""")
 _add_doc(u, """Text literal""")
 
@@ -381,7 +387,10 @@ if PY3:
 
     import urllib.parse
 
-    unquote = urllib.parse.unquote
+    def unquote_to_wsgi_str(string):
+        return _unquote_to_bytes(string).decode('latin-1')
+
+    _unquote_to_bytes = urllib.parse.unquote_to_bytes
     urlsplit = urllib.parse.urlsplit
     urlparse = urllib.parse.urlparse
 
@@ -396,4 +405,4 @@ else:
     urlparse = orig_urlparse.urlparse
 
     import urllib
-    unquote = urllib.unquote
+    unquote_to_wsgi_str = urllib.unquote

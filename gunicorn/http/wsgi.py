@@ -8,8 +8,7 @@ import os
 import re
 import sys
 
-from gunicorn.six import (unquote, string_types, binary_type, reraise,
-        text_type)
+from gunicorn.six import unquote_to_wsgi_str, string_types, binary_type, reraise
 from gunicorn import SERVER_SOFTWARE
 import gunicorn.util as util
 
@@ -25,6 +24,7 @@ except ImportError:
 NORMALIZE_SPACE = re.compile(r'(?:\r\n)?[ \t]+')
 
 log = logging.getLogger(__name__)
+
 
 class FileWrapper:
 
@@ -58,6 +58,7 @@ def default_environ(req, sock, cfg):
         "SERVER_PROTOCOL": "HTTP/%s" % ".".join([str(v) for v in req.version])
     }
 
+
 def proxy_environ(req):
     info = req.proxy_protocol_info
 
@@ -72,6 +73,7 @@ def proxy_environ(req):
         "PROXY_PORT": str(info["proxy_port"]),
     }
 
+
 def create(req, sock, client, server, cfg):
     resp = Response(req, sock)
 
@@ -81,7 +83,7 @@ def create(req, sock, client, server, cfg):
     # may not qualify the remote addr:
     # http://www.ietf.org/rfc/rfc3875
     forward = client or "127.0.0.1"
-    url_scheme = "http"
+    url_scheme = "https" if cfg.is_ssl else "http"
     script_name = os.environ.get("SCRIPT_NAME", "")
 
     secure_headers = cfg.secure_scheme_headers
@@ -95,7 +97,7 @@ def create(req, sock, client, server, cfg):
         if hdr_name == "EXPECT":
             # handle expect
             if hdr_value.lower() == "100-continue":
-                sock.send("HTTP/1.1 100 Continue\r\n\r\n")
+                sock.send(b"HTTP/1.1 100 Continue\r\n\r\n")
         elif x_forwarded_for_header and hdr_name == x_forwarded_for_header:
             forward = hdr_value
         elif secure_headers and (hdr_name.upper() in secure_headers and
@@ -127,7 +129,7 @@ def create(req, sock, client, server, cfg):
 
         # find host and port on ipv6 address
         if '[' in forward and ']' in forward:
-            host =  forward.split(']')[0][1:].lower()
+            host = forward.split(']')[0][1:].lower()
         elif ":" in forward and forward.count(":") == 1:
             host = forward.split(":")[0].lower()
         else:
@@ -147,7 +149,7 @@ def create(req, sock, client, server, cfg):
     environ['REMOTE_PORT'] = str(remote[1])
 
     if isinstance(server, string_types):
-        server =  server.split(":")
+        server = server.split(":")
         if len(server) == 1:
             if url_scheme == "http":
                 server.append("80")
@@ -161,12 +163,13 @@ def create(req, sock, client, server, cfg):
     path_info = req.path
     if script_name:
         path_info = path_info.split(script_name, 1)[1]
-    environ['PATH_INFO'] = unquote(path_info)
+    environ['PATH_INFO'] = unquote_to_wsgi_str(path_info)
     environ['SCRIPT_NAME'] = script_name
 
     environ.update(proxy_environ(req))
 
     return resp, environ
+
 
 class Response(object):
 
@@ -191,6 +194,8 @@ class Response(object):
             return True
         if self.response_length is not None or self.chunked:
             return False
+        if self.status_code < 200 or self.status_code in (204, 304):
+            return False
         return True
 
     def start_response(self, status, headers, exc_info=None):
@@ -204,6 +209,15 @@ class Response(object):
             raise AssertionError("Response headers already set!")
 
         self.status = status
+
+        # get the status code from the response here so we can use it to check
+        # the need for the connection header later without parsing the string
+        # each time.
+        try:
+            self.status_code = int(self.status.split()[0])
+        except ValueError:
+            self.status_code = None
+
         self.process_headers(headers)
         self.chunked = self.is_chunked()
         return self.write
@@ -229,16 +243,15 @@ class Response(object):
                 continue
             self.headers.append((name.strip(), value))
 
-
     def is_chunked(self):
         # Only use chunked responses when the client is
         # speaking HTTP/1.1 or newer and there was
         # no Content-Length header set.
         if self.response_length is not None:
             return False
-        elif self.req.version <= (1,0):
+        elif self.req.version <= (1, 0):
             return False
-        elif self.status.startswith("304") or self.status.startswith("204"):
+        elif self.status_code in (204, 304):
             # Do not use chunked responses when the response is guaranteed to
             # not have a response body.
             return False
@@ -268,7 +281,7 @@ class Response(object):
         if self.headers_sent:
             return
         tosend = self.default_headers()
-        tosend.extend(["%s: %s\r\n" % (k,v) for k, v in self.headers])
+        tosend.extend(["%s: %s\r\n" % (k, v) for k, v in self.headers])
 
         header_str = "%s\r\n" % "".join(tosend)
         util.write(self.sock, util.to_bytestring(header_str))
@@ -276,9 +289,6 @@ class Response(object):
 
     def write(self, arg):
         self.send_headers()
-
-        if isinstance(arg, text_type):
-            arg = arg.encode('utf-8')
 
         assert isinstance(arg, binary_type), "%r is not a byte." % arg
 
@@ -315,9 +325,9 @@ class Response(object):
                 nbytes -= BLKSIZE
         else:
             sent = 0
-            sent += sendfile(sockno, fileno, offset+sent, nbytes-sent)
+            sent += sendfile(sockno, fileno, offset + sent, nbytes - sent)
             while sent != nbytes:
-                sent += sendfile(sockno, fileno, offset+sent, nbytes-sent)
+                sent += sendfile(sockno, fileno, offset + sent, nbytes - sent)
 
     def write_file(self, respiter):
         if sendfile is not None and \

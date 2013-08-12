@@ -19,6 +19,7 @@ from gunicorn.http.errors import InvalidProxyLine, ForbiddenProxyRequest
 from gunicorn.http.wsgi import default_environ, Response
 from gunicorn.six import MAXSIZE
 
+
 class Worker(object):
 
     SIGNALS = [getattr(signal, "SIG%s" % x) \
@@ -26,7 +27,7 @@ class Worker(object):
 
     PIPE = []
 
-    def __init__(self, age, ppid, socket, app, timeout, cfg, log):
+    def __init__(self, age, ppid, sockets, app, timeout, cfg, log):
         """\
         This is called pre-fork so it shouldn't do anything to the
         current process. If there's a need to make process wide
@@ -34,7 +35,7 @@ class Worker(object):
         """
         self.age = age
         self.ppid = ppid
-        self.socket = socket
+        self.sockets = sockets
         self.app = app
         self.timeout = timeout
         self.cfg = cfg
@@ -45,7 +46,6 @@ class Worker(object):
         self.alive = True
         self.log = log
         self.debug = cfg.debug
-        self.address = self.socket.getsockname()
         self.tmp = WorkerTmp(cfg)
 
     def __str__(self):
@@ -90,7 +90,7 @@ class Worker(object):
             util.close_on_exec(p)
 
         # Prevent fd inherientence
-        util.close_on_exec(self.socket)
+        [util.close_on_exec(s) for s in self.sockets]
         util.close_on_exec(self.tmp.fileno())
 
         self.log.close_on_exec()
@@ -98,6 +98,8 @@ class Worker(object):
         self.init_signals()
 
         self.wsgi = self.app.wsgi()
+
+        self.cfg.post_worker_init(self)
 
         # Enter main run loop
         self.booted = True
@@ -130,7 +132,7 @@ class Worker(object):
 
     def handle_error(self, req, client, addr, exc):
         request_start = datetime.now()
-        addr = addr or ('', -1) # unix socket case
+        addr = addr or ('', -1)  # unix socket case
         if isinstance(exc, (InvalidRequestLine, InvalidRequestMethod,
             InvalidHTTPVersion, InvalidHeader, InvalidHeaderName,
             LimitRequestLine, LimitRequestHeaders,
@@ -148,7 +150,7 @@ class Worker(object):
             elif isinstance(exc, (InvalidHeaderName, InvalidHeader,)):
                 mesg = "<p>%s</p>" % str(exc)
                 if not req and hasattr(exc, "req"):
-                    req = exc.req # for access log
+                    req = exc.req  # for access log
             elif isinstance(exc, LimitRequestLine):
                 mesg = "<p>%s</p>" % str(exc)
             elif isinstance(exc, LimitRequestHeaders):

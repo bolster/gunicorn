@@ -34,7 +34,7 @@ class AltArgs(object):
 
 class NoConfigApp(Application):
     def __init__(self):
-        super(NoConfigApp, self).__init__("no_usage")
+        super(NoConfigApp, self).__init__("no_usage", prog="gunicorn_test")
 
     def init(self, parser, opts, args):
         pass
@@ -63,7 +63,7 @@ def test_property_access():
     t.eq(c.workers, 3)
 
     # Address is parsed
-    t.eq(c.address, ("127.0.0.1", 8000))
+    t.eq(c.address, [("127.0.0.1", 8000)])
 
     # User and group defaults
     t.eq(os.geteuid(), c.uid)
@@ -165,7 +165,7 @@ def test_callable_validation_for_string():
 def test_cmd_line():
     with AltArgs(["prog_name", "-b", "blargh"]):
         app = NoConfigApp()
-        t.eq(app.cfg.bind, "blargh")
+        t.eq(app.cfg.bind, ["blargh"])
     with AltArgs(["prog_name", "-w", "3"]):
         app = NoConfigApp()
         t.eq(app.cfg.workers, 3)
@@ -183,12 +183,56 @@ def test_app_config():
 def test_load_config():
     with AltArgs(["prog_name", "-c", cfg_file()]):
         app = NoConfigApp()
-    t.eq(app.cfg.bind, "unix:/tmp/bar/baz")
+    t.eq(app.cfg.bind, ["unix:/tmp/bar/baz"])
     t.eq(app.cfg.workers, 3)
     t.eq(app.cfg.proc_name, "fooey")
 
 def test_cli_overrides_config():
     with AltArgs(["prog_name", "-c", cfg_file(), "-b", "blarney"]):
         app = NoConfigApp()
-        t.eq(app.cfg.bind, "blarney")
+        t.eq(app.cfg.bind, ["blarney"])
         t.eq(app.cfg.proc_name, "fooey")
+
+def test_default_config_file():
+    default_config = os.path.join(os.path.abspath(os.getcwd()), 
+                                                  'gunicorn.conf.py')
+    with open(default_config, 'w+') as default:
+        default.write("bind='0.0.0.0:9090'")
+    
+    t.eq(config.get_default_config_file(), default_config)
+
+    with AltArgs(["prog_name"]):
+        app = NoConfigApp()
+        t.eq(app.cfg.bind, ["0.0.0.0:9090"])
+
+    os.unlink(default_config)
+
+def test_post_request():
+    c = config.Config()
+
+    def post_request_4(worker, req, environ, resp):
+        return 4
+
+    def post_request_3(worker, req, environ):
+        return 3
+
+    def post_request_2(worker, req):
+        return 2
+
+    c.set("post_request", post_request_4)
+    t.eq(4, c.post_request(1, 2, 3, 4))
+
+    c.set("post_request", post_request_3)
+    t.eq(3, c.post_request(1, 2, 3, 4))
+
+    c.set("post_request", post_request_2)
+    t.eq(2, c.post_request(1, 2, 3, 4))
+
+
+def test_nworkers_changed():
+    c = config.Config()
+    def nworkers_changed_3(server, new_value, old_value):
+        return 3
+
+    c.set("nworkers_changed", nworkers_changed_3)
+    t.eq(3, c.nworkers_changed(1, 2, 3))

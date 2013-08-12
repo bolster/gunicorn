@@ -16,12 +16,15 @@ from paste.deploy import loadapp, loadwsgi
 SERVER = loadwsgi.SERVER
 
 from gunicorn.app.base import Application
-from gunicorn.config import Config
+from gunicorn.config import Config, get_default_config_file
+from gunicorn import util
+
 
 class PasterBaseApplication(Application):
+    gcfg = None
 
     def app_config(self):
-        cx = loadwsgi.loadcontext(SERVER, self.cfgurl, relative_to=self.relpath)
+        cx = loadwsgi.loadcontext(SERVER, self.cfgurl, relative_to=self.relpath, global_conf=self.gcfg)
         gc, lc = cx.global_conf.copy(), cx.local_conf.copy()
         cfg = {}
 
@@ -29,7 +32,7 @@ class PasterBaseApplication(Application):
         if host and port:
             cfg['bind'] = '%s:%s' % (host, port)
         elif host:
-            cfg['bind'] = host
+            cfg['bind'] = host.split(',')
 
         cfg['workers'] = int(lc.get('workers', 1))
         cfg['umask'] = int(lc.get('umask', 0))
@@ -55,17 +58,10 @@ class PasterBaseApplication(Application):
             parser = ConfigParser.ConfigParser()
             parser.read([self.cfgfname])
             if parser.has_section('loggers'):
-                if sys.version_info >= (2, 6):
-                    from logging.config import fileConfig
-                else:
-                    # Use our custom fileConfig -- 2.5.1's with a custom Formatter class
-                    # and less strict whitespace (which were incorporated into 2.6's)
-                    from gunicorn.logging_config import fileConfig
-
+                from logging.config import fileConfig
                 config_file = os.path.abspath(self.cfgfname)
                 fileConfig(config_file, dict(__file__=config_file,
                                              here=os.path.dirname(config_file)))
-
 
 
 class PasterApplication(PasterBaseApplication):
@@ -74,7 +70,8 @@ class PasterApplication(PasterBaseApplication):
         if len(args) != 1:
             parser.error("No application name specified.")
 
-        cfgfname = os.path.normpath(os.path.join(os.getcwd(), args[0]))
+        cwd = util.getcwd()
+        cfgfname = os.path.normpath(os.path.join(cwd, args[0]))
         cfgfname = os.path.abspath(cfgfname)
         if not os.path.exists(cfgfname):
             parser.error("Config file not found: %s" % cfgfname)
@@ -89,12 +86,14 @@ class PasterApplication(PasterBaseApplication):
         return self.app_config()
 
     def load(self):
-        return loadapp(self.cfgurl, relative_to=self.relpath)
+        return loadapp(self.cfgurl, relative_to=self.relpath, global_conf=self.gcfg)
+
 
 class PasterServerApplication(PasterBaseApplication):
 
     def __init__(self, app, gcfg=None, host="127.0.0.1", port=None, *args, **kwargs):
         self.cfg = Config()
+        self.gcfg = gcfg # need to hold this for app_config 
         self.app = app
         self.callable = None
 
@@ -111,7 +110,7 @@ class PasterServerApplication(PasterBaseApplication):
             bind = "%s:%s" % (host, port)
         else:
             bind = host
-        cfg["bind"] = bind
+        cfg["bind"] = bind.split(',')
 
         if gcfg:
             for k, v in gcfg.items():
@@ -127,23 +126,14 @@ class PasterServerApplication(PasterBaseApplication):
             sys.stderr.flush()
             sys.exit(1)
 
-
-    def load_config(self):
-        if not hasattr(self, "cfgfname"):
-            return
-
-        cfg = self.app_config()
-        for k,v in cfg.items():
-            try:
-                self.cfg.set(k.lower(), v)
-            except:
-                sys.stderr.write("Invalid value for %s: %s\n\n" % (k, v))
-                raise
+        if cfg.get("config"):
+            self.load_config_from_file(cfg["config"])
+        else:
+            default_config = get_default_config_file()
+            if default_config is not None:
+                self.load_config_from_file(default_config)
 
     def load(self):
-        if hasattr(self, "cfgfname"):
-            return loadapp(self.cfgurl, relative_to=self.relpath)
-
         return self.app
 
 
@@ -153,7 +143,8 @@ def run():
     apllications like Pylons or Turbogears2
     """
     from gunicorn.app.pasterapp import PasterApplication
-    PasterApplication("%prog [OPTIONS] pasteconfig.ini").run()
+    PasterApplication("%(prog)s [OPTIONS] pasteconfig.ini").run()
+
 
 def paste_server(app, gcfg=None, host="127.0.0.1", port=None, *args, **kwargs):
     """\

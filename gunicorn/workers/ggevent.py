@@ -8,6 +8,7 @@ from __future__ import with_statement
 import os
 import sys
 from datetime import datetime
+from functools import partial
 import time
 
 # workaround on osx, disable kqueue
@@ -37,6 +38,7 @@ BASE_WSGI_ENV = {
     'wsgi.run_once': False
 }
 
+
 class GeventWorker(AsyncWorker):
 
     server_class = None
@@ -48,51 +50,77 @@ class GeventWorker(AsyncWorker):
         monkey.noisy = False
         monkey.patch_all()
 
+    def notify(self):
+        super(GeventWorker, self).notify()
+        if self.ppid != os.getppid():
+            self.log.info("Parent changed, shutting down: %s", self)
+            sys.exit(0)
+
     def timeout_ctx(self):
         return gevent.Timeout(self.cfg.keepalive, False)
 
     def run(self):
-        self.socket.setblocking(1)
+        servers = []
+        ssl_args = {}
 
-        pool = Pool(self.worker_connections)
-        if self.server_class is not None:
-            server = self.server_class(
-                self.socket, application=self.wsgi, spawn=pool, log=self.log,
-                handler_class=self.wsgi_handler)
-        else:
-            server = StreamServer(self.socket, handle=self.handle, spawn=pool)
+        if self.cfg.is_ssl:
+            ssl_args = dict(server_side=True,
+                    do_handshake_on_connect=False, **self.cfg.ssl_options)
 
-        server.start()
-        pid = os.getpid()
+        for s in self.sockets:
+            s.setblocking(1)
+            pool = Pool(self.worker_connections)
+            if self.server_class is not None:
+                server = self.server_class(
+                    s, application=self.wsgi, spawn=pool, log=self.log,
+                    handler_class=self.wsgi_handler, **ssl_args)
+            else:
+                hfun = partial(self.handle, s)
+                server = StreamServer(s, handle=hfun, spawn=pool, **ssl_args)
+
+            server.start()
+            servers.append(server)
+
         try:
             while self.alive:
                 self.notify()
-
-                if  pid == os.getpid() and self.ppid != os.getppid():
-                    self.log.info("Parent changed, shutting down: %s", self)
-                    break
-
                 gevent.sleep(1.0)
 
         except KeyboardInterrupt:
             pass
+        except:
+            try:
+                server.stop()
+            except:
+                pass
+            raise
 
         try:
             # Stop accepting requests
-            server.kill()
+            for server in servers:
+                if hasattr(server, 'close'): # gevent 1.0
+                    server.close()
+                if hasattr(server, 'kill'):  # gevent < 1.0
+                    server.kill()
 
             # Handle current requests until graceful_timeout
             ts = time.time()
             while time.time() - ts <= self.cfg.graceful_timeout:
-                if server.pool.free_count() == server.pool.size:
-                    return # all requests was handled
+                accepting = 0
+                for server in servers:
+                    if server.pool.free_count() != server.pool.size:
+                        accepting += 1
+
+                # if no server is accepting a connection, we can exit
+                if not accepting:
+                    return
 
                 self.notify()
                 gevent.sleep(1.0)
 
             # Force kill all active the handlers
             self.log.warning("Worker graceful timeout (pid:%s)" % self.pid)
-            server.stop(timeout=1)
+            [server.stop(timeout=1) for server in servers]
         except:
             pass
 
@@ -100,6 +128,8 @@ class GeventWorker(AsyncWorker):
         try:
             super(GeventWorker, self).handle_request(*args)
         except gevent.GreenletExit:
+            pass
+        except SystemExit:
             pass
 
     if gevent.version_info[0] == 0:
@@ -119,11 +149,11 @@ class GeventResponse(object):
     headers = None
     response_length = None
 
-
     def __init__(self, status, headers, clength):
         self.status = status
         self.headers = headers
         self.response_length = clength
+
 
 class PyWSGIHandler(pywsgi.WSGIHandler):
 
@@ -131,9 +161,12 @@ class PyWSGIHandler(pywsgi.WSGIHandler):
         start = datetime.fromtimestamp(self.time_start)
         finish = datetime.fromtimestamp(self.time_finish)
         response_time = finish - start
-        resp = GeventResponse(self.status, self.response_headers,
-                self.response_length)
-        req_headers = [h.split(":", 1) for h in self.headers.headers]
+        resp_headers = getattr(self, 'response_headers', {})
+        resp = GeventResponse(self.status, resp_headers, self.response_length)
+        if hasattr(self, 'headers'):
+            req_headers = [h.split(":", 1) for h in self.headers.headers]
+        else:
+            req_headers = []
         self.server.log.access(resp, req_headers, self.environ, response_time)
 
     def get_environ(self):
@@ -142,8 +175,10 @@ class PyWSGIHandler(pywsgi.WSGIHandler):
         env['RAW_URI'] = self.path
         return env
 
+
 class PyWSGIServer(pywsgi.WSGIServer):
     base_env = BASE_WSGI_ENV
+
 
 class GeventPyWSGIWorker(GeventWorker):
     "The Gevent StreamServer based workers."
